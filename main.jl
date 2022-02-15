@@ -1,70 +1,190 @@
 
+# import Libraries
+# Linear Algebra: used for singular value decomposition
+# Luxor: used for creating output png images of the simulation result
+# Colors: Color support for Luxor
 using LinearAlgebra, Luxor, Colors
 
-dt = 0.0002
-CRIT_COMPRESS = 1-1.9e-2
-CRIT_STRETCH = 1+7.5e-3
-HARDENING = 5.0
-YOUNGS_MODULUS = 1.5e5
-POISSONS_RATIO = 0.2
-LAMBDA = YOUNGS_MODULUS*POISSONS_RATIO/((1+POISSONS_RATIO)*(1-2*POISSONS_RATIO))
-MU = YOUNGS_MODULUS/(2+2*POISSONS_RATIO)
+dt = 0.0002 # timestep
+CRIT_COMPRESS = 1-1.9e-2 # Fracture threshold for compression
+CRIT_STRETCH = 1+7.5e-3 # Fracture threshold for stretching
+HARDENING = 5.0 # How much plastic deformation strengthens material
+YOUNGS_MODULUS = 1.5e5 # Young's modulus (springiness)
+POISSONS_RATIO = 0.2 # Poisson's ratio (transverse/axial strain ratio) 
 BSPLINE_EPSILON = 1e-4
 BSPLINE_RADIUS = 2
-PARTICLE_DIAM = .0072
-DENSITY = 100.0
+PARTICLE_DIAM = .0072 # Diameter of each particle; smaller = higher resolution
+DENSITY = 100.0 # Density of snow in kg/m^2
 GRAVITY = -9.8
 
+# Hardening parameters
+LAMBDA = YOUNGS_MODULUS*POISSONS_RATIO/((1+POISSONS_RATIO)*(1-2*POISSONS_RATIO))
+MU = YOUNGS_MODULUS/(2+2*POISSONS_RATIO)
 
-function bspline(x::Float64)::Float64
+# Particle parameters
+PARTICLE_AREA = PARTICLE_DIAM^2
+PARTICLE_MASS = PARTICLE_AREA * DENSITY
+
+# Particle class
+mutable struct Particle
+    volume::Float64 #体積
+    mass::Float64 #質量
+    position::Vector{Float64} #位置
+    velocity::Vector{Float64} #速度
+    def_elastic::Matrix{Float64} #変形勾配の弾性部分
+    def_plastic::Matrix{Float64} #変形勾配の塑性部分
+
+    # intermediate parameters (中間パラメーター)
+    weight_gradientsX::Matrix{Float64} #重みの勾配X
+    weight_gradientsY::Matrix{Float64} #重みの勾配Y
+    weights::Matrix{Float64} #重み
+    velocity_gradient::Matrix{Float64} #速度勾配
+end
+
+#Particle constructor
+function Particle(pos::Vector{Float64}, vel::Vector{Float64}, mass::Float64)::Particle
+    volume = 0.0 #とりあえず
+    def_elastic = [1.0 0.0; 0.0 1.0] #変形勾配の初期値は単位行列
+    def_plastic = [1.0 0.0; 0.0 1.0] #変形勾配の初期値は単位行列
+    weight_gradientsX = zeros(Float64, 4, 4) #4*4の0行列をつくっておく
+    weight_gradientsY = zeros(Float64, 4, 4) #4*4の0行列をつくっておく
+    weights = zeros(Float64, 4, 4) #4*4の0行列をつくっておく
+    velocity_gradient = zeros(Float64, 2, 2)#2*2の0行列をつくっておく
+    return Particle(volume, mass, pos, vel, def_elastic, def_plastic, weight_gradientsX, weight_gradientsY, weights, velocity_gradient)
+end
+
+#GridNode class
+mutable struct GridNode
+    mass::Float64 #質量
+    velocity::Vector{Float64} #速度
+    velocity_new::Vector{Float64} #新しい速度
+
+    #intermediate parameters (中間パラメーター)
+    active::Bool #アクティブかどうか
+end
+
+#Grid class
+mutable struct Grid
+    cellsize::Float64 #セルの一辺の長さ
+    node_area::Float64 #セルの面積
+    nodes::Matrix{GridNode} #セルたち
+    cellcount::Int64 #グリッドの一辺のセル数
+end
+
+#Grid constructor
+function Grid(cells::Int64)::Grid #cellsはグリッドの一辺のセル数
+    cellSize = 1.0 / cells #セルの一辺の長さ
+    grid = Grid(cellSize, cellSize * cellSize, Matrix{GridNode}(undef, cells, cells), cells)
+    for i in 1:cells, j in 1:cells
+        grid.nodes[i, j] = GridNode(0.0, [0.0, 0.0], [0.0, 0.0], false)
+    end
+    return grid
+end
+
+#one-dimensional cubic B-splines
+function N(x::Float64)::Float64
     x = abs(x)
     w = 0.0
     if x < 1.0
-        w = x*x*(x/2.0 - 1.0) + 2.0/3.0;
+        w = 1.0/2.0 * x^3 - x^2 + 2.0/3.0;
     elseif x < 2.0
-        w = x*(x*(-x/6.0 + 1.0) - 2.0) + 4.0/3.0;
+        w = -1.0/6.0 * x^3 + x^2 - 2x + 4.0/3.0;
     else
         return 0.0
     end
-    if w < BSPLINE_EPSILON
+    if w < BSPLINE_EPSILON #値が小さすぎるといろいろ発散しちゃうから制限を設ける
         return 0.0
     end
     return w
 end
 
-function bsplineSlope(x::Float64)::Float64
+#N(x)のxでの偏微分
+function N_x(x::Float64)::Float64
     absX = abs(x)
     if absX < 1.0
-        return 1.5*x*absX - 2.0*x;
-    elseif x < 2.0
-        return -x*absX/2.0 + 2.0*x - 2.0*x/absX;
+        return 3.0/2.0*x*absX - 2.0*x;
+    elseif absX < 2.0
+        return -1.0/2.0 * x*absX + 2.0x - 2.0*x/absX;
     else
         return 0.0
     end
 end
 
-mutable struct Particle
-    volume::Float64
-    mass::Float64
-    position::Vector{Float64}
-    velocity::Vector{Float64}
-    def_elastic::Matrix{Float64}
-    def_plastic::Matrix{Float64}
-    weight_gradientsX::Matrix{Float64}
-    weight_gradientsY::Matrix{Float64}
-    weights::Matrix{Float64}
-    velocity_gradient::Matrix{Float64}
+particles = Array{Particle}([]) #パーティクルの配列を作成
+grid = Grid(64) #グリッドを生成
+
+#雪のかたまり1を生成
+segmentSize1 = 0.3 #雪のかたまり1の一辺の長さ
+area1 = segmentSize1 * segmentSize1 #雪のかたまり1の面積
+particleCount1 = round(Int64, area1 / PARTICLE_AREA) #雪のかたまり1の面積と雪の粒子の面積からパーティクル数を計算
+for p in 1:particleCount1
+    push!(particles, Particle([0.3 + segmentSize1 * rand(), 0.3 + segmentSize1 * rand()], [2.0, 0.0], PARTICLE_MASS))
 end
 
-function Particle(pos::Vector{Float64}, vel::Vector{Float64}, mass::Float64)::Particle
-    volume = 0.0
-    def_elastic = [1.0 0.0; 0.0 1.0]
-    def_plastic = [1.0 0.0; 0.0 1.0]
-    weight_gradientsX = zeros(Float64, 4, 4)
-    weight_gradientsY = zeros(Float64, 4, 4)
-    weights = zeros(Float64, 4, 4)
-    velocity_gradient = zeros(Float64, 2, 2)
-    return Particle(volume, mass, pos, vel, def_elastic, def_plastic, weight_gradientsX, weight_gradientsY, weights, velocity_gradient)
+#雪のかたまり2を生成
+segmentSize2 = 0.2 #雪のかたまり2の一辺の長さ
+area2 = segmentSize2 * segmentSize2 #雪のかたまり2の面積
+particleCount2 = round(Int64, area2 / PARTICLE_AREA) #雪のかたまり2の面積と雪の粒子の面積からパーティクル数を計算
+for p in 1:particleCount2
+    push!(particles, Particle([0.7 + segmentSize2 * rand(), 0.7 + segmentSize2 * rand()], [0.0, -2.0], PARTICLE_MASS))
+end
+
+function resetParameters()
+    for i in 1:grid.cellcount, j in 1:grid.cellcount #reset all GridNode parameters to 0
+        grid.nodes[i, j].mass = 0.0
+        grid.nodes[i, j].active = false
+        grid.nodes[i, j].velocity = [0.0, 0.0]
+        grid.nodes[i, j].velocity_new = [0.0, 0.0]
+    end
+    for p in particles #reset all weight parameters to 0
+        for i in 1:4, j in 1:4
+            p.weights[i, j] = 0.0
+            p.weight_gradientsX[i, j] = 0.0
+            p.weight_gradientsY[i, j] = 0.0
+        end
+    end
+end
+
+# Rasterize particle mass to the grid
+function P2Gmass()
+    for p in particles
+        gridIndex::Vector{Int64} = floor.(Int64, p.position ./ grid.cellsize) #パーティクル座標からグリッド座標に変換
+        for i in 0:3, j in 0:3 #パーティクル周囲の4*4グリッドで重みの計算を行う
+            distance = (p.position ./ grid.cellsize) - (gridIndex + [i-1, j-1]) #パーティクルと各グリッド点との距離
+            indexI = gridIndex[1] + i #グリッド座標
+            indexJ = gridIndex[2] + j #グリッド座標
+            wy = N(distance[2])
+            dy = N_x(distance[2])
+            wx = N(distance[1])
+            dx = N_x(distance[1])
+            weight::Float64 = wx * wy
+            p.weights[i+1, j+1] = weight
+            p.weight_gradientsX[i+1, j+1] = (dx * wy) / grid.cellsize #なんでgrid.cellsizeで割るのかはわからないけどなぜかこうしないと動かない
+            p.weight_gradientsY[i+1, j+1] = (wx * dy) / grid.cellsize #なんでgrid.cellsizeで割るのかはわからないけどなぜかこうしないと動かない
+            grid.nodes[indexI, indexJ].mass += weight * p.mass
+        end
+    end
+end
+
+# Rasterize particle velocity to the grid
+function P2Gvel()
+    for p in particles
+        gridIndex::Vector{Int64} = floor.(Int64, p.position ./ grid.cellsize) #パーティクル座標からグリッド座標に変換
+        for i in 0:3, j in 0:3
+            indexI = gridIndex[1] + i
+            indexJ = gridIndex[2] + j
+            w = p.weights[i+1, j+1]
+            if w > BSPLINE_EPSILON
+                grid.nodes[indexI, indexJ].velocity += p.velocity .* (w * p.mass)
+                grid.nodes[indexI, indexJ].active = true
+            end
+        end
+    end
+    for i in 1:grid.cellcount, j in 1:grid.cellcount
+        if grid.nodes[i, j].active 
+            grid.nodes[i, j].velocity = grid.nodes[i, j].velocity ./ grid.nodes[i, j].mass
+        end
+    end
 end
 
 
@@ -81,140 +201,35 @@ function energyDerivative(self::Particle)::Matrix{Float64}
     return (self.volume * harden) .* temp
 end
 
-
-mutable struct GridNode
-    mass::Float64
-    active::Bool
-    velocity::Vector{Float64}
-    velocity_new::Vector{Float64}
-end
-
-mutable struct Grid
-    cellsize::Vector{Float64}
-    node_area::Float64
-    nodes::Matrix{GridNode}
-    cellcount::Int64
-end
-
-function Grid(dims::Vector{Float64}, cells::Vector{Int64})::Grid
-    cellSize = [dims[1] / cells[1], dims[2] / cells[2]]
-    grid = Grid(cellSize, cellSize[1] * cellSize[2], Matrix{GridNode}(undef, cells[1], cells[2]), cells[1])
-    for y in 1:cells[2]
-        for x in 1:cells[1]
-            grid.nodes[x, y] = GridNode(0.0, false, [0.0, 0.0], [0.0, 0.0])
-        end
-    end
-    return grid
-end
-
-
-particle_area = PARTICLE_DIAM^2
-particle_mass = particle_area * DENSITY
-segmentSize = 0.3
-area = segmentSize * segmentSize * 0.8
-particleCount = round(Int64, area / particle_area)
-tempArea = 0.2 * 0.2
-particles2 = round(Int64, tempArea / particle_area)
-
-
-max_velocity = 0.0
-particles = Array{Particle}([])
-for p in 1:particleCount
-    push!(particles, Particle([0.3 + segmentSize * rand(), 0.3 + segmentSize * rand()], [2.0, 0.0],particle_mass))
-end
-
-for p in 1:particles2
-    push!(particles, Particle([0.7 + 0.2 * rand(), 0.7 + 0.2 * rand()], [0.0, -2.0],particle_mass))
-end
-
-max_velocity = 2.0^2 + 0.0^2
-
-self = Grid([1.0, 1.0], [64, 64])
-
-function initializeMass()
-    for i in 1:self.cellcount, j in 1:self.cellcount
-        self.nodes[i, j].mass = 0.0
-        self.nodes[i, j].active = false
-        self.nodes[i, j].velocity = [0.0, 0.0]
-        self.nodes[i, j].velocity_new = [0.0, 0.0]
-    end
-    for p in particles
-        for i in 1:4, j in 1:4
-            p.weights[i, j] = 0.0
-            p.weight_gradientsX[i, j] = 0.0
-            p.weight_gradientsY[i, j] = 0.0
-        end
-    end
-    for p in particles
-        gridIndex::Vector{Int64} = floor.(Int64, p.position ./ self.cellsize[1])
-        for i in 0:3, j in 0:3
-            distance = (p.position ./ self.cellsize[1]) - (gridIndex + [i-1, j-1])
-            # println(distance)
-            indexI = gridIndex[1] + i
-            indexJ = gridIndex[2] + j
-            wy = bspline(distance[2])
-            dy = bsplineSlope(distance[2])
-            wx = bspline(distance[1])
-            dx = bsplineSlope(distance[1])
-            weight::Float64 = wx * wy
-            p.weights[i+1, j+1] = weight
-            p.weight_gradientsX[i+1, j+1] = (dx * wy) / self.cellsize[1]
-            p.weight_gradientsY[i+1, j+1] = (wx * dy) / self.cellsize[2]
-            self.nodes[indexI, indexJ].mass += weight * p.mass
-        end
-    end
-end
-
 function collisionGrid()
-    for i in 1:self.cellcount, j in 1:self.cellcount
-        if self.nodes[i, j].active
-            new_pos = (self.nodes[i, j].velocity_new .* (dt ./ self.cellsize[1])) + [i-1, j-1]
-            if new_pos[1] < BSPLINE_RADIUS || new_pos[1] > self.cellcount - BSPLINE_RADIUS-1
-                self.nodes[i, j].velocity_new[1] = 0
-                self.nodes[i, j].velocity_new[2] *= 0.9
+    for i in 1:grid.cellcount, j in 1:grid.cellcount
+        if grid.nodes[i, j].active
+            new_pos = (grid.nodes[i, j].velocity_new .* (dt ./ grid.cellsize)) + [i-1, j-1]
+            if new_pos[1] < BSPLINE_RADIUS || new_pos[1] > grid.cellcount - BSPLINE_RADIUS-1
+                grid.nodes[i, j].velocity_new[1] = 0
+                grid.nodes[i, j].velocity_new[2] *= 0.9
             end
-            if new_pos[2] < BSPLINE_RADIUS || new_pos[2] > self.cellcount - BSPLINE_RADIUS-1
-                self.nodes[i, j].velocity_new[2] = 0
-                self.nodes[i, j].velocity_new[1] *= 0.9
-            end
-        end
-    end
-end
-
-function initializeVelocities()
-    for p in particles
-        gridIndex::Vector{Int64} = floor.(Int64, p.position ./ self.cellsize[1])
-        for i in 0:3, j in 0:3
-            indexI = gridIndex[1] + i
-            indexJ = gridIndex[2] + j
-            w = p.weights[i+1, j+1]
-            if w > BSPLINE_EPSILON
-                self.nodes[indexI, indexJ].velocity += p.velocity .* (w * p.mass)
-                self.nodes[indexI, indexJ].active = true
+            if new_pos[2] < BSPLINE_RADIUS || new_pos[2] > grid.cellcount - BSPLINE_RADIUS-1
+                grid.nodes[i, j].velocity_new[2] = 0
+                grid.nodes[i, j].velocity_new[1] *= 0.9
             end
         end
     end
-    for i in 1:self.cellcount, j in 1:self.cellcount
-        if self.nodes[i, j].active 
-            self.nodes[i, j].velocity = self.nodes[i, j].velocity ./ self.nodes[i, j].mass
-        end
-    end
-    collisionGrid()
 end
 
 function calculateVolumes()
     for p in particles
-        gridIndex::Vector{Int64} = floor.(Int64, p.position ./ self.cellsize[1])
+        gridIndex::Vector{Int64} = floor.(Int64, p.position ./ grid.cellsize)
         density = 0.0
         for i in 0:3, j in 0:3
             indexI = gridIndex[1] + i
             indexJ = gridIndex[2] + j
             w = p.weights[i+1, j+1]
             if w > BSPLINE_EPSILON
-                density += w * self.nodes[indexI, indexJ].mass
+                density += w * grid.nodes[indexI, indexJ].mass
             end
         end
-        density /= self.node_area
+        density /= grid.node_area
         p.volume = p.mass / density
     end
 end
@@ -222,19 +237,19 @@ end
 function explicitVelocities(gravity::Vector{Float64})
     for p in particles
         energy = energyDerivative(p)
-        gridIndex::Vector{Int64} = floor.(Int64, p.position ./ self.cellsize[1])
+        gridIndex::Vector{Int64} = floor.(Int64, p.position ./ grid.cellsize)
         for i in 0:3, j in 0:3
             indexI = gridIndex[1] + i
             indexJ = gridIndex[2] + j
             w = p.weights[i+1, j+1]
             if w > BSPLINE_EPSILON
-                self.nodes[indexI, indexJ].velocity_new += energy * [p.weight_gradientsX[i+1, j+1], p.weight_gradientsY[i+1, j+1]]
+                grid.nodes[indexI, indexJ].velocity_new += energy * [p.weight_gradientsX[i+1, j+1], p.weight_gradientsY[i+1, j+1]]
             end
         end
     end
-    for i in 1:self.cellcount, j in 1:self.cellcount
-        if self.nodes[i, j].active == true
-            self.nodes[i, j].velocity_new = self.nodes[i, j].velocity + dt .* ([0.0, GRAVITY] - (self.nodes[i, j].velocity_new ./ self.nodes[i, j].mass))
+    for i in 1:grid.cellcount, j in 1:grid.cellcount
+        if grid.nodes[i, j].active == true
+            grid.nodes[i, j].velocity_new = grid.nodes[i, j].velocity + dt .* ([0.0, GRAVITY] - (grid.nodes[i, j].velocity_new ./ grid.nodes[i, j].mass))
         end
     end
     collisionGrid()
@@ -243,12 +258,12 @@ end
 
 function collisionParticles()
     for p in particles
-        grid_position = p.position ./ self.cellsize[1]
-        new_pos = grid_position + (dt .* (p.velocity ./ self.cellsize[1]))
-        if new_pos[1] < BSPLINE_RADIUS || new_pos[1] > self.cellcount - BSPLINE_RADIUS
+        grid_position = p.position ./ grid.cellsize
+        new_pos = grid_position + (dt .* (p.velocity ./ grid.cellsize))
+        if new_pos[1] < BSPLINE_RADIUS || new_pos[1] > grid.cellcount - BSPLINE_RADIUS
             p.velocity[1] = -0.9 * p.velocity[1]
         end
-        if new_pos[2] < BSPLINE_RADIUS || new_pos[2] > self.cellcount - BSPLINE_RADIUS
+        if new_pos[2] < BSPLINE_RADIUS || new_pos[2] > grid.cellcount - BSPLINE_RADIUS
             p.velocity[2] = -0.9 * p.velocity[2]
         end
     end
@@ -259,15 +274,15 @@ function updateVelocities()
         pic = [0.0, 0.0]
         flip = copy(p.velocity)
         p.velocity_gradient = zeros(Float64, 2, 2)
-        gridIndex::Vector{Int64} = floor.(Int64, p.position ./ self.cellsize[1])
+        gridIndex::Vector{Int64} = floor.(Int64, p.position ./ grid.cellsize)
         for i in 0:3, j in 0:3
             indexI = gridIndex[1] + i
             indexJ = gridIndex[2] + j
             w = p.weights[i+1, j+1]
             if w > BSPLINE_EPSILON
-                pic += self.nodes[indexI, indexJ].velocity_new .* w
-                flip += (self.nodes[indexI, indexJ].velocity_new - self.nodes[indexI, indexJ].velocity) .* w
-                p.velocity_gradient += self.nodes[indexI, indexJ].velocity_new * transpose([p.weight_gradientsX[i+1, j+1], p.weight_gradientsY[i+1, j+1]])
+                pic += grid.nodes[indexI, indexJ].velocity_new .* w
+                flip += (grid.nodes[indexI, indexJ].velocity_new - grid.nodes[indexI, indexJ].velocity) .* w
+                p.velocity_gradient += grid.nodes[indexI, indexJ].velocity_new * transpose([p.weight_gradientsX[i+1, j+1], p.weight_gradientsY[i+1, j+1]])
             end
         end
         p.velocity = flip .* 0.95 + pic .* (1 - 0.95)
@@ -275,7 +290,7 @@ function updateVelocities()
     collisionParticles()
 end
 
-initializeMass()
+P2Gmass()
 calculateVolumes()
 
 frame = 0
@@ -284,8 +299,10 @@ frame = 0
 for i in 1:1000
     global frame += 1
     gravity = [0.0, GRAVITY]
-    initializeMass()
-    initializeVelocities()
+    resetParameters()
+    P2Gmass()
+    P2Gvel()
+    collisionGrid()
     explicitVelocities(gravity)
     updateVelocities()
     global max_velocity = 0.0
