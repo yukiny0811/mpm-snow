@@ -88,7 +88,7 @@ function N(x::Float64)::Float64
     if x < 1.0
         w = 1.0/2.0 * x^3 - x^2 + 2.0/3.0;
     elseif x < 2.0
-        w = -1.0/6.0 * x^3 + x^2 - 2x + 4.0/3.0;
+        w = -1.0/6.0 * x^3 + x^2 - 2x + 4.0/3.0; 
     else
         return 0.0
     end
@@ -171,12 +171,12 @@ function P2Gvel()
     for p in particles
         gridIndex::Vector{Int64} = floor.(Int64, p.position ./ grid.cellsize) #パーティクル座標からグリッド座標に変換
         for i in 0:3, j in 0:3
-            indexI = gridIndex[1] + i
-            indexJ = gridIndex[2] + j
+            indexI = gridIndex[1] + i #グリッド座標
+            indexJ = gridIndex[2] + j #グリッド座標
             w = p.weights[i+1, j+1]
-            if w > BSPLINE_EPSILON
+            if w > BSPLINE_EPSILON #重みが小さすぎるといろいろ値が発散しちゃうから制限している
                 grid.nodes[indexI, indexJ].velocity += p.velocity .* (w * p.mass)
-                grid.nodes[indexI, indexJ].active = true
+                grid.nodes[indexI, indexJ].active = true #グリッドセルをアクティブにする
             end
         end
     end
@@ -187,36 +187,7 @@ function P2Gvel()
     end
 end
 
-
-
-function energyDerivative(self::Particle)::Matrix{Float64}
-    svdResult = svd(copy(self.def_elastic))
-    w::Matrix{Float64} = copy(svdResult.U)
-    v::Matrix{Float64} = copy(svdResult.V)
-    e::Matrix{Float64} = diagm(copy(svdResult.S))
-    harden::Float64 = exp(HARDENING * (1.0 - det(self.def_plastic)))
-    Je::Float64 = e[1, 1] * e[2, 2]
-    temp::Matrix{Float64} = (2.0 * MU) .* (self.def_elastic - w * v') * self.def_elastic'
-    temp = temp + diagm([LAMBDA * Je * (Je - 1.0), LAMBDA * Je * (Je - 1.0)])
-    return (self.volume * harden) .* temp
-end
-
-function collisionGrid()
-    for i in 1:grid.cellcount, j in 1:grid.cellcount
-        if grid.nodes[i, j].active
-            new_pos = (grid.nodes[i, j].velocity_new .* (dt ./ grid.cellsize)) + [i-1, j-1]
-            if new_pos[1] < BSPLINE_RADIUS || new_pos[1] > grid.cellcount - BSPLINE_RADIUS-1
-                grid.nodes[i, j].velocity_new[1] = 0
-                grid.nodes[i, j].velocity_new[2] *= 0.9
-            end
-            if new_pos[2] < BSPLINE_RADIUS || new_pos[2] > grid.cellcount - BSPLINE_RADIUS-1
-                grid.nodes[i, j].velocity_new[2] = 0
-                grid.nodes[i, j].velocity_new[1] *= 0.9
-            end
-        end
-    end
-end
-
+# calculateVolumes
 function calculateVolumes()
     for p in particles
         gridIndex::Vector{Int64} = floor.(Int64, p.position ./ grid.cellsize)
@@ -234,37 +205,52 @@ function calculateVolumes()
     end
 end
 
-function explicitVelocities(gravity::Vector{Float64})
+function computeGridForces()
     for p in particles
-        energy = energyDerivative(p)
+        JP = det(p.def_plastic)
+        JE = det(p.def_plastic)
+        svdResult = svd(p.def_elastic)
+        W = svdResult.U
+        V = svdResult.V
+        RE = W * V'
+        mu = MU * exp(HARDENING * (1.0 - JP))
+        lambda = LAMBDA * exp(HARDENING * (1.0 - JP))
+        sigma = 2.0 * mu / JP * (p.def_elastic - RE) * p.def_elastic' + lambda / JP * (JE - 1.0) * JE * [1.0 0.0; 0.0 1.0]
+        Jn = det(p.def_elastic * p.def_plastic)
+        Vn = Jn * p.volume
+        energy = Vn * sigma
         gridIndex::Vector{Int64} = floor.(Int64, p.position ./ grid.cellsize)
         for i in 0:3, j in 0:3
             indexI = gridIndex[1] + i
             indexJ = gridIndex[2] + j
             w = p.weights[i+1, j+1]
             if w > BSPLINE_EPSILON
-                grid.nodes[indexI, indexJ].velocity_new += energy * [p.weight_gradientsX[i+1, j+1], p.weight_gradientsY[i+1, j+1]]
+                grid.nodes[indexI, indexJ].velocity_new -= energy * [p.weight_gradientsX[i+1, j+1], p.weight_gradientsY[i+1, j+1]]
             end
         end
     end
-    for i in 1:grid.cellcount, j in 1:grid.cellcount
-        if grid.nodes[i, j].active == true
-            grid.nodes[i, j].velocity_new = grid.nodes[i, j].velocity + dt .* ([0.0, GRAVITY] - (grid.nodes[i, j].velocity_new ./ grid.nodes[i, j].mass))
-        end
-    end
-    collisionGrid()
 end
 
-
-function collisionParticles()
-    for p in particles
-        grid_position = p.position ./ grid.cellsize
-        new_pos = grid_position + (dt .* (p.velocity ./ grid.cellsize))
-        if new_pos[1] < BSPLINE_RADIUS || new_pos[1] > grid.cellcount - BSPLINE_RADIUS
-            p.velocity[1] = -0.9 * p.velocity[1]
+function updateGridVelocities()
+    for i in 1:grid.cellcount, j in 1:grid.cellcount
+        if grid.nodes[i, j].active == true
+            grid.nodes[i, j].velocity_new = grid.nodes[i, j].velocity + dt .* ([0.0, GRAVITY] + (grid.nodes[i, j].velocity_new ./ grid.nodes[i, j].mass))
         end
-        if new_pos[2] < BSPLINE_RADIUS || new_pos[2] > grid.cellcount - BSPLINE_RADIUS
-            p.velocity[2] = -0.9 * p.velocity[2]
+    end
+end
+
+function collisionGrid()
+    for i in 1:grid.cellcount, j in 1:grid.cellcount
+        if grid.nodes[i, j].active
+            new_pos = (grid.nodes[i, j].velocity_new .* (dt ./ grid.cellsize)) + [i-1, j-1]
+            if new_pos[1] < BSPLINE_RADIUS || new_pos[1] > grid.cellcount - BSPLINE_RADIUS-1
+                grid.nodes[i, j].velocity_new[1] = 0
+                grid.nodes[i, j].velocity_new[2] *= 0.9
+            end
+            if new_pos[2] < BSPLINE_RADIUS || new_pos[2] > grid.cellcount - BSPLINE_RADIUS-1
+                grid.nodes[i, j].velocity_new[2] = 0
+                grid.nodes[i, j].velocity_new[1] *= 0.9
+            end
         end
     end
 end
@@ -287,7 +273,46 @@ function updateVelocities()
         end
         p.velocity = flip .* 0.95 + pic .* (1 - 0.95)
     end
-    collisionParticles()
+end
+
+function collisionParticles()
+    for p in particles
+        grid_position = p.position ./ grid.cellsize
+        new_pos = grid_position + (dt .* (p.velocity ./ grid.cellsize))
+        if new_pos[1] < BSPLINE_RADIUS || new_pos[1] > grid.cellcount - BSPLINE_RADIUS
+            p.velocity[1] = -0.9 * p.velocity[1]
+        end
+        if new_pos[2] < BSPLINE_RADIUS || new_pos[2] > grid.cellcount - BSPLINE_RADIUS
+            p.velocity[2] = -0.9 * p.velocity[2]
+        end
+    end
+end
+
+function updateDeformationGradient()
+    for p in particles
+        p.velocity_gradient = [1.0 0.0; 0.0 1.0] + dt .* p.velocity_gradient
+        p.def_elastic = p.velocity_gradient * p.def_elastic
+        f_all::Matrix{Float64} = p.def_elastic * p.def_plastic
+        svdResult = svd(copy(p.def_elastic))
+        w::Matrix{Float64} = copy(svdResult.U)
+        v::Matrix{Float64} = copy(svdResult.V)
+        e::Matrix{Float64} = diagm(copy(svdResult.S))
+        for i in 1:2
+            if e[i, i] < CRIT_COMPRESS
+                e[i, i] = CRIT_COMPRESS
+            elseif e[i, i] > CRIT_STRETCH
+                e[i, i] = CRIT_STRETCH
+            end
+        end
+        p.def_plastic = v * inv(e) * w' * f_all
+        p.def_elastic = w * e * v'
+    end
+end
+
+function updateParticlePositions()
+    for p in particles
+        p.position = p.position + (dt .* p.velocity)
+    end
 end
 
 P2Gmass()
@@ -302,35 +327,12 @@ for i in 1:1000
     resetParameters()
     P2Gmass()
     P2Gvel()
+    computeGridForces()
+    updateGridVelocities()
     collisionGrid()
-    explicitVelocities(gravity)
+    updateDeformationGradient()
     updateVelocities()
-    global max_velocity = 0.0
-    for p in particles
-        p.position = p.position + (dt .* p.velocity)
-
-        p.velocity_gradient = p.velocity_gradient .* dt
-        p.velocity_gradient = p.velocity_gradient + [1.0 0.0; 0.0 1.0]
-        p.def_elastic = p.velocity_gradient * p.def_elastic
-
-        f_all::Matrix{Float64} = p.def_elastic * p.def_plastic
-        svdResult = svd(copy(p.def_elastic))
-        w::Matrix{Float64} = copy(svdResult.U)
-        v::Matrix{Float64} = copy(svdResult.V)
-        e::Matrix{Float64} = diagm(copy(svdResult.S))
-        for i in 1:2
-            if e[i, i] < CRIT_COMPRESS
-                e[i, i] = CRIT_COMPRESS
-            elseif e[i, i] > CRIT_STRETCH
-                e[i, i] = CRIT_STRETCH
-            end
-        end
-        vcopy = copy(v * inv(e))
-        wcopy = copy(w * e)
-        p.def_plastic = vcopy * w' * f_all
-        p.def_elastic = wcopy * v'
-
-    end
+    updateParticlePositions()
 
     println(frame)
 
@@ -344,10 +346,14 @@ for i in 1:1000
     println(vsum)
     println(particles[1].velocity)
 
+    if i % 20 != 0
+        continue    
+    end
+
     @png begin
         sethue("pink")
         for p in particles
             ellipse(p.position[1] * 600 - 300, p.position[2] * 600 - 300, 3, 3, :fill)
         end
-    end 600 600 "./images/mpm-$(i).png"
+    end 600 600 "./images/mpm-$(floor(Int64, i/20)).png"
 end
