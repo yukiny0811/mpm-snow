@@ -9,3 +9,7 @@ Alexey Stomakhin, Craig Schroeder, Lawrence Chai, Joseph Teran, Andrew Selle. : 
 - https://github.com/kodai100/OpenGL_MPMSnowSimulation2D
 - https://mocobt.hatenablog.com/entry/2020/07/06/033628
 
+## Dependencies
+- julia 1.7.1
+  - Luxor 3.0.0
+  - Colors 0.12.8
