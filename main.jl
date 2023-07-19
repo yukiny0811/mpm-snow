@@ -208,7 +208,7 @@ end
 function computeGridForces()
     for p in particles
         JP = det(p.def_plastic)
-        JE = det(p.def_plastic)
+        JE = det(p.def_elastic)
         svdResult = svd(p.def_elastic)
         W = svdResult.U
         V = svdResult.V
